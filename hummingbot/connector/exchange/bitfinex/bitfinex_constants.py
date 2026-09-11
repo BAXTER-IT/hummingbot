@@ -18,13 +18,20 @@ BOOK_PATH = "/v2/book/{symbol}/P0"
 TICKER_PATH = "/v2/ticker/{symbol}"
 # private REST (reads only; orders never go here)
 SUMMARY_PATH = "/v2/auth/r/summary"
-ACTIVE_ORDERS_PATH = "/v2/auth/r/orders"
-ORDER_HISTORY_PATH = "/v2/auth/r/orders/hist"
+ACTIVE_ORDERS_PATH = "/v2/auth/r/orders/{symbol}"
+ORDER_HISTORY_PATH = "/v2/auth/r/orders/{symbol}/hist"
 ORDER_TRADES_PATH = "/v2/auth/r/order/{symbol}:{order_id}/trades"
 
 # pub:info:pair row: [symbol, [.., .., .., min_order_size, max_order_size, .., .., .., initial_margin, min_margin, .., ..]]
 PAIR_INFO_MIN_ORDER_SIZE = 3
 PAIR_INFO_MAX_ORDER_SIZE = 4
+# order row: [ID, GID, CID, SYMBOL, MTS_CREATE, MTS_UPDATE, AMOUNT, AMOUNT_ORIG, TYPE, TYPE_PREV, _, _, FLAGS, STATUS,
+#             _, _, PRICE, PRICE_AVG, ...]; trade row: [ID, PAIR, MTS_CREATE, ORDER_ID, EXEC_AMOUNT, EXEC_PRICE,
+#             ORDER_TYPE, ORDER_PRICE, MAKER, FEE, FEE_CURRENCY]
+ORDER_ID, ORDER_SYMBOL, ORDER_MTS_UPDATE, ORDER_AMOUNT, ORDER_AMOUNT_ORIG, ORDER_STATUS, ORDER_PRICE, ORDER_PRICE_AVG = \
+    0, 3, 5, 6, 7, 13, 16, 17
+TRADE_ROW_ID, TRADE_ROW_MTS, TRADE_ROW_ORDER_ID, TRADE_ROW_AMOUNT, TRADE_ROW_PRICE, TRADE_ROW_MAKER, TRADE_ROW_FEE, \
+    TRADE_ROW_FEE_CCY = 0, 2, 3, 4, 5, 8, 9, 10
 # ticker: [bid, bid_size, ask, ask_size, daily_change, daily_change_rel, last_price, volume, high, low, ...]
 TICKER_BID, TICKER_ASK, TICKER_LAST = 0, 2, 6
 # book P0 row: [price, count, amount]; amount > 0 bid, < 0 ask, count == 0 delete

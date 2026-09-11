@@ -34,6 +34,11 @@ def _hb_currency(bfx: str) -> str:
     return _BFX_TO_HB_CURRENCY.get(bfx, bfx)
 
 
+def hb_currency(bfx: str) -> str:
+    """Bitfinex currency code -> the market's (``UST`` -> ``USDT``)."""
+    return _hb_currency(bfx)
+
+
 def fix_symbol(trading_pair: str) -> str:
     """``BTC-USDT`` -> ``BTCUST``; codes longer than three characters take Bitfinex's ``:`` form (``AAVE:UST``)."""
     base, quote = trading_pair.split("-")

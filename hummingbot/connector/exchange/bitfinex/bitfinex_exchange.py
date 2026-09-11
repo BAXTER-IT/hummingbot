@@ -19,6 +19,7 @@ from hummingbot.connector.exchange.bitfinex import (
     bitfinex_web_utils as web_utils,
 )
 from hummingbot.connector.exchange.bitfinex.bitfinex_api_order_book_data_source import BitfinexAPIOrderBookDataSource
+from hummingbot.connector.exchange.bitfinex.bitfinex_auth import BitfinexAuth
 from hummingbot.connector.exchange.bitfinex.bitfinex_fix_gateway import BitfinexFixGateway, FixOrderRejected
 from hummingbot.connector.exchange.bitfinex.bitfinex_fix_user_stream_data_source import BitfinexFixUserStreamDataSource
 from hummingbot.connector.exchange.bitfinex.bitfinex_trade_limits import (
@@ -32,21 +33,13 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-
-
-class _NoAuth(AuthBase):
-    async def rest_authenticate(self, request):
-        return request
-
-    async def ws_authenticate(self, request):
-        return request
 
 
 class BitfinexExchange(ExchangePyBase):
@@ -99,7 +92,7 @@ class BitfinexExchange(ExchangePyBase):
 
     @property
     def authenticator(self) -> AuthBase:
-        return _NoAuth()  # B4 brings the REST HMAC auth for the private reads
+        return BitfinexAuth(api_key=self._api_key, secret_key=self._secret_key)
 
     @property
     def rate_limits_rules(self):
@@ -314,11 +307,68 @@ class BitfinexExchange(ExchangePyBase):
         elif kind == "pre_close":
             self.logger().warning(f"Bitfinex session pre-close: {event['text']} — no new orders until the next logon")
 
+    # -- private REST reads: the backup poll and post-midnight recovery ------------------------
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        raise NotImplementedError("slice B4")
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+        venue_id = await tracked_order.get_exchange_order_id()
+        body = {"id": [int(venue_id)]}
+        row = None
+        for path in (CONSTANTS.ACTIVE_ORDERS_PATH, CONSTANTS.ORDER_HISTORY_PATH):
+            rows = await self._api_post(path_url=path.format(symbol=symbol), data=body, limit_id=path, is_auth_required=True)
+            row = next((r for r in rows or [] if str(r[CONSTANTS.ORDER_ID]) == str(venue_id)), None)
+            if row is not None:
+                break
+        if row is None:
+            raise IOError(f"order {venue_id} ({tracked_order.client_order_id}) not found on Bitfinex")
+        return OrderUpdate(
+            trading_pair=tracked_order.trading_pair, update_timestamp=float(row[CONSTANTS.ORDER_MTS_UPDATE]) / 1000,
+            new_state=self._state_from_status(str(row[CONSTANTS.ORDER_STATUS] or ""), row),
+            client_order_id=tracked_order.client_order_id, exchange_order_id=str(row[CONSTANTS.ORDER_ID]),
+        )
+
+    @staticmethod
+    def _state_from_status(status: str, row) -> OrderState:
+        """Bitfinex status strings: ACTIVE, EXECUTED @ p(a), PARTIALLY FILLED @ p(a), CANCELED, POSTONLY CANCELED,
+        INSUFFICIENT BALANCE (…) was: …, RSN_… rejects."""
+        upper = status.upper()
+        if upper.startswith("EXECUTED"):
+            return OrderState.FILLED
+        if upper.startswith("PARTIALLY FILLED"):
+            return OrderState.PARTIALLY_FILLED
+        if "CANCELED" in upper or "INSUFFICIENT" in upper:
+            return OrderState.CANCELED
+        if upper.startswith("ACTIVE"):
+            remaining, original = Decimal(str(row[CONSTANTS.ORDER_AMOUNT])), Decimal(str(row[CONSTANTS.ORDER_AMOUNT_ORIG]))
+            return OrderState.PARTIALLY_FILLED if abs(remaining) < abs(original) else OrderState.OPEN
+        if upper.startswith("RSN_") or "REJECT" in upper:
+            return OrderState.FAILED
+        return OrderState.OPEN
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        raise NotImplementedError("slice B4")
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+        venue_id = await order.get_exchange_order_id()
+        rows = await self._api_post(path_url=CONSTANTS.ORDER_TRADES_PATH.format(symbol=symbol, order_id=venue_id),
+                                    data={}, limit_id=CONSTANTS.ORDER_TRADES_PATH, is_auth_required=True)
+        updates = []
+        for row in rows or []:
+            amount = abs(Decimal(str(row[CONSTANTS.TRADE_ROW_AMOUNT])))
+            price = Decimal(str(row[CONSTANTS.TRADE_ROW_PRICE]))
+            fee_amount = abs(Decimal(str(row[CONSTANTS.TRADE_ROW_FEE] or 0)))
+            fee_token = utils.hb_currency(str(row[CONSTANTS.TRADE_ROW_FEE_CCY] or order.quote_asset))
+            fee = TradeFeeBase.new_spot_fee(fee_schema=self.trade_fee_schema(), trade_type=order.trade_type,
+                                            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)])
+            updates.append(TradeUpdate(
+                trade_id=str(row[CONSTANTS.TRADE_ROW_ID]), client_order_id=order.client_order_id,
+                exchange_order_id=str(row[CONSTANTS.TRADE_ROW_ORDER_ID]), trading_pair=order.trading_pair,
+                fill_timestamp=float(row[CONSTANTS.TRADE_ROW_MTS]) / 1000, fill_price=price, fill_base_amount=amount,
+                fill_quote_amount=amount * price, fee=fee, is_taker=int(row[CONSTANTS.TRADE_ROW_MAKER] or 0) != 1,
+            ))
+        return updates
+
+    async def _api_post(self, path_url: str, data: Optional[dict] = None, limit_id: Optional[str] = None,
+                        is_auth_required: bool = True, **kwargs):
+        return await self._api_request(path_url=path_url, method=RESTMethod.POST, data=data, limit_id=limit_id,
+                                       is_auth_required=is_auth_required, **kwargs)
 
     # -- balances: ABOS's published trade limits ------------------------------------------------
     @property
