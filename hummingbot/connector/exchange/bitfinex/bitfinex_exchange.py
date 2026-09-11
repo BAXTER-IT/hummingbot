@@ -21,6 +21,12 @@ from hummingbot.connector.exchange.bitfinex import (
 from hummingbot.connector.exchange.bitfinex.bitfinex_api_order_book_data_source import BitfinexAPIOrderBookDataSource
 from hummingbot.connector.exchange.bitfinex.bitfinex_fix_gateway import BitfinexFixGateway, FixOrderRejected
 from hummingbot.connector.exchange.bitfinex.bitfinex_fix_user_stream_data_source import BitfinexFixUserStreamDataSource
+from hummingbot.connector.exchange.bitfinex.bitfinex_trade_limits import (
+    AbosTradeLimitsClient,
+    TradeLimit,
+    TradeLimitBudgetChecker,
+)
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -56,6 +62,10 @@ class BitfinexExchange(ExchangePyBase):
         bitfinex_fix_host: str = "",
         bitfinex_fix_port: int = 0,
         bitfinex_fix_tls: bool = True,
+        bitfinex_abos_url: str = "",
+        bitfinex_abos_username: str = "",
+        bitfinex_abos_password: str = "",
+        bitfinex_abos_account_id: int = 0,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
@@ -76,6 +86,10 @@ class BitfinexExchange(ExchangePyBase):
             username=bitfinex_fix_username, password=bitfinex_fix_password, use_tls=bitfinex_fix_tls,
             log=lambda line: self.logger().info(line),
         )
+        self._trade_limits: Dict[str, TradeLimit] = {}
+        self._abos_client = AbosTradeLimitsClient(bitfinex_abos_url, bitfinex_abos_username, bitfinex_abos_password,
+                                                  bitfinex_abos_account_id) if bitfinex_abos_url else None
+        self._trade_limit_budget_checker: Optional[TradeLimitBudgetChecker] = None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # -- identity -----------------------------------------------------------------------
@@ -306,9 +320,46 @@ class BitfinexExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         raise NotImplementedError("slice B4")
 
-    # -- balances: ABOS's published trade limits, slice B4 -------------------------------------
+    # -- balances: ABOS's published trade limits ------------------------------------------------
+    @property
+    def budget_checker(self) -> TradeLimitBudgetChecker:
+        if self._trade_limit_budget_checker is None:
+            self._trade_limit_budget_checker = TradeLimitBudgetChecker(self, lambda: self._trade_limits)
+        return self._trade_limit_budget_checker
+
+    @property
+    def trade_limits(self) -> Dict[str, TradeLimit]:
+        return dict(self._trade_limits)
+
     async def _update_balances(self):
-        raise NotImplementedError("slice B4: balances are ABOS's published trade limits")
+        if self._abos_client is None:
+            raise RuntimeError("Bitfinex balances are ABOS's published trade limits: configure bitfinex_abos_url/"
+                               "username/password/account_id")
+        limits = await self._abos_client.fetch()
+        mids: Dict[str, Decimal] = {}
+        for pair in limits:
+            try:
+                mid = self.get_price_by_type(pair, PriceType.MidPrice)
+                mids[pair] = mid if mid and not mid.is_nan() else Decimal("0")
+            except Exception:  # noqa: BLE001 — no book for this pair: quote allowance unpriced
+                mids[pair] = Decimal("0")
+        self._apply_trade_limits(limits, mids)
+
+    def _apply_trade_limits(self, limits: Dict[str, TradeLimit], mid_prices: Dict[str, Decimal]) -> None:
+        """Balances derived from the allowance: base = what we may still sell, quote = what we may still buy,
+        priced at mid. The budget checker uses the allowance directly; these are for inventory logic and display."""
+        self._trade_limits = dict(limits)
+        base_totals: Dict[str, Decimal] = {}
+        quote_totals: Dict[str, Decimal] = {}
+        for pair, limit in limits.items():
+            base, quote = pair.split("-")
+            base_totals[base] = base_totals.get(base, Decimal("0")) + limit.max_sell
+            quote_totals[quote] = quote_totals.get(quote, Decimal("0")) + limit.max_buy * mid_prices.get(pair, Decimal("0"))
+        balances = {**quote_totals}
+        for asset, amount in base_totals.items():
+            balances[asset] = balances.get(asset, Decimal("0")) + amount
+        self._account_balances = dict(balances)
+        self._account_available_balances = dict(balances)
 
     async def _api_get(self, path_url: str, limit_id: Optional[str] = None, **kwargs):
         return await self._api_request(path_url=path_url, method=RESTMethod.GET, limit_id=limit_id, **kwargs)

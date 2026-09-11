@@ -45,4 +45,5 @@ def test_default_fees_and_registration_metadata_exist():
     assert utils.DEFAULT_FEES.taker_percent_fee_decimal == Decimal("0.002")
     fields = set(utils.KEYS.model_fields)
     assert {"bitfinex_api_key", "bitfinex_secret_key", "bitfinex_fix_username", "bitfinex_fix_password",
-            "bitfinex_fix_sender_comp_id"} <= fields
+            "bitfinex_fix_sender_comp_id", "bitfinex_abos_url", "bitfinex_abos_username", "bitfinex_abos_password",
+            "bitfinex_abos_account_id"} <= fields

@@ -111,6 +111,27 @@ class BitfinexConfigMap(BaseConnectorConfigMap):
         json_schema_extra={"prompt": "Bitfinex FIX gateway port", "is_secure": False, "is_connect_key": True,
                            "prompt_on_new": True},
     )
+    # balances = ABOS's published trade limits, read as a customer user scoped to the bot's account
+    bitfinex_abos_url: str = Field(
+        default="",
+        json_schema_extra={"prompt": "ABOS web app base URL (e.g. https://demo1.abos.baxtech.hu)", "is_secure": False,
+                           "is_connect_key": True, "prompt_on_new": True},
+    )
+    bitfinex_abos_username: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={"prompt": "ABOS customer user for the bot's account", "is_secure": True,
+                           "is_connect_key": True, "prompt_on_new": True},
+    )
+    bitfinex_abos_password: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={"prompt": "ABOS customer user's password", "is_secure": True, "is_connect_key": True,
+                           "prompt_on_new": True},
+    )
+    bitfinex_abos_account_id: int = Field(
+        default=0,
+        json_schema_extra={"prompt": "ABOS account id the bot trades as (e.g. 42297)", "is_secure": False,
+                           "is_connect_key": True, "prompt_on_new": True},
+    )
     model_config = ConfigDict(title="bitfinex")
 
 
