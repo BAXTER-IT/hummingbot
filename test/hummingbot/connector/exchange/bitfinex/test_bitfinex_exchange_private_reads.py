@@ -13,6 +13,7 @@ from hummingbot.connector.exchange.bitfinex.bitfinex_exchange import BitfinexExc
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 
+
 # Bitfinex order array: [ID, GID, CID, SYMBOL, MTS_CREATE, MTS_UPDATE, AMOUNT, AMOUNT_ORIG, TYPE, TYPE_PREV, _, _,
 #                        FLAGS, STATUS, _, _, PRICE, PRICE_AVG, ...]
 def order_row(order_id, status, amount, amount_orig, price, price_avg="0", symbol="tBTCUST"):
