@@ -7,6 +7,7 @@ NotImplementedError until their slices land — the connector is constructible a
 data with ``trading_required=False``.
 """
 
+import asyncio
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,10 +19,12 @@ from hummingbot.connector.exchange.bitfinex import (
     bitfinex_web_utils as web_utils,
 )
 from hummingbot.connector.exchange.bitfinex.bitfinex_api_order_book_data_source import BitfinexAPIOrderBookDataSource
+from hummingbot.connector.exchange.bitfinex.bitfinex_fix_gateway import BitfinexFixGateway, FixOrderRejected
+from hummingbot.connector.exchange.bitfinex.bitfinex_fix_user_stream_data_source import BitfinexFixUserStreamDataSource
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -52,6 +55,7 @@ class BitfinexExchange(ExchangePyBase):
         bitfinex_fix_sender_comp_id: str,
         bitfinex_fix_host: str = "",
         bitfinex_fix_port: int = 0,
+        bitfinex_fix_tls: bool = True,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
@@ -67,6 +71,11 @@ class BitfinexExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._fix_gateway = BitfinexFixGateway(
+            host=bitfinex_fix_host, port=int(bitfinex_fix_port or 0), sender_comp_id=bitfinex_fix_sender_comp_id,
+            username=bitfinex_fix_username, password=bitfinex_fix_password, use_tls=bitfinex_fix_tls,
+            log=lambda line: self.logger().info(line),
+        )
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # -- identity -----------------------------------------------------------------------
@@ -205,19 +214,91 @@ class BitfinexExchange(ExchangePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return "unknown order" in str(cancelation_exception).lower()
 
-    # -- order path over FIX: slice B3 ----------------------------------------------------------
+    # -- order path over FIX -----------------------------------------------------------------
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                            order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
-        raise NotImplementedError("Bitfinex orders go over FIX: slice B3")
+        try:
+            return await self._fix_gateway.place_order(
+                client_order_id=order_id, trading_pair=trading_pair, is_buy=trade_type is TradeType.BUY, amount=amount,
+                price=None if order_type is OrderType.MARKET or price is None or price.is_nan() else price,
+                order_type="market" if order_type is OrderType.MARKET else "limit",
+                post_only=order_type is OrderType.LIMIT_MAKER,
+            )
+        except FixOrderRejected as err:
+            raise IOError(f"Bitfinex rejected {order_id}: {err}") from err
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        raise NotImplementedError("Bitfinex cancels go over FIX: slice B3")
+        """Sends the cancel; the venue's ExecutionReport (or OrderCancelReject) finalises it later."""
+        try:
+            await self._fix_gateway.cancel_order(client_order_id=order_id, exchange_order_id=tracked_order.exchange_order_id)
+        except FixOrderRejected as err:
+            raise IOError(f"Bitfinex cancel of {order_id} not sent: {err}") from err
+        return True
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
-        return UserStreamTrackerDataSource()  # replaced by the FIX session in slice B3
+        return BitfinexFixUserStreamDataSource(self._fix_gateway)
+
+    def _is_user_stream_initialized(self) -> bool:
+        return self._fix_gateway.logged_on or not self.is_trading_required
 
     async def _user_stream_event_listener(self):
-        raise NotImplementedError("slice B3")
+        async for event in self._iter_user_event_queue():
+            try:
+                await self._process_fix_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — one bad report must not stop the stream
+                self.logger().exception(f"Error processing FIX event {event.get('kind')} for {event.get('client_order_id')}")
+
+    @staticmethod
+    async def _await_if_needed(result):
+        """The order tracker schedules updates as tasks; awaiting them keeps report order and state in step."""
+        if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    _ORD_STATUS_TO_STATE = {"0": OrderState.OPEN, "1": OrderState.PARTIALLY_FILLED, "2": OrderState.FILLED,
+                            "4": OrderState.CANCELED, "5": OrderState.OPEN, "8": OrderState.FAILED}
+
+    async def _process_fix_event(self, event: Dict[str, Any]) -> None:
+        kind = event["kind"]
+        if kind == "execution_report":
+            client_order_id = event["client_order_id"]
+            fillable = self._order_tracker.all_fillable_orders.get(client_order_id)
+            updatable = self._order_tracker.all_updatable_orders.get(client_order_id)
+            if event["exec_type"] == "F" and fillable is not None and event["last_qty"]:
+                is_maker = event["is_maker"] if event["is_maker"] is not None else fillable.order_type is OrderType.LIMIT_MAKER
+                fee = self.get_fee(fillable.base_asset, fillable.quote_asset, fillable.order_type, fillable.trade_type,
+                                   event["last_qty"], event["last_px"], is_maker=is_maker)
+                await self._await_if_needed(self._order_tracker.process_trade_update(TradeUpdate(
+                    trade_id=event["exec_id"], client_order_id=client_order_id,
+                    exchange_order_id=event["exchange_order_id"] or fillable.exchange_order_id,
+                    trading_pair=fillable.trading_pair, fill_timestamp=event["timestamp"], fill_price=event["last_px"],
+                    fill_base_amount=event["last_qty"], fill_quote_amount=event["last_qty"] * event["last_px"], fee=fee,
+                    is_taker=not is_maker,
+                )))
+            if updatable is not None:
+                new_state = self._ORD_STATUS_TO_STATE.get(event["ord_status"], updatable.current_state)
+                await self._await_if_needed(self._order_tracker.process_order_update(OrderUpdate(
+                    trading_pair=updatable.trading_pair, update_timestamp=event["timestamp"], new_state=new_state,
+                    client_order_id=client_order_id, exchange_order_id=event["exchange_order_id"] or updatable.exchange_order_id,
+                    misc_updates={"text": event["text"]} if event["text"] else None,
+                )))
+        elif kind == "cancel_reject":
+            if event["reason"] == "1":  # unknown order: the venue does not have it
+                await self._order_tracker.process_order_not_found(event["client_order_id"])
+            else:
+                self.logger().info(f"Bitfinex cancel reject for {event['client_order_id']}: {event['text']} (reason {event['reason']})")
+        elif kind == "disconnected":
+            # Session-TIF orders die with the FIX connection: the gateway cancels them on disconnect.
+            for order in list(self._order_tracker.all_updatable_orders.values()):
+                await self._await_if_needed(self._order_tracker.process_order_update(OrderUpdate(
+                    trading_pair=order.trading_pair, update_timestamp=event["timestamp"], new_state=OrderState.CANCELED,
+                    client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+                    misc_updates={"text": f"FIX session ended: {event['text']}"},
+                )))
+        elif kind == "pre_close":
+            self.logger().warning(f"Bitfinex session pre-close: {event['text']} — no new orders until the next logon")
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         raise NotImplementedError("slice B4")
