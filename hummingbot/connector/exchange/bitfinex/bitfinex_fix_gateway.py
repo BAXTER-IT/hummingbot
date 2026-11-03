@@ -21,7 +21,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 from hummingbot.connector.exchange.bitfinex import bitfinex_constants as CONSTANTS, bitfinex_utils as utils
 from hummingbot.connector.exchange.bitfinex.fix.message import FixMessage, FixProtocolError
-from hummingbot.connector.exchange.bitfinex.fix.session import FixLogonError, FixSession, SessionState
+from hummingbot.connector.exchange.bitfinex.fix.session import ApiKeyLogon, FixLogonError, FixSession, SessionState
 
 Log = Callable[[str], None]
 
@@ -50,8 +50,8 @@ class BitfinexFixGateway:
         host: str,
         port: int,
         sender_comp_id: str,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
         target_comp_id: str = CONSTANTS.FIX_TARGET_COMP_ID,
         heartbeat_s: float = CONSTANTS.FIX_DEFAULT_HEARTBEAT_S,
         use_tls: bool = True,
@@ -60,10 +60,13 @@ class BitfinexFixGateway:
         max_reconnect_wait_s: float = 30.0,
         place_timeout_s: float = 10.0,
         log: Log = print,
+        api_key_logon: Optional[ApiKeyLogon] = None,
     ) -> None:
+        # one ApiKeyLogon for every reconnect: its nonce keeps counting up across sessions
         self._session_kwargs = dict(host=host, port=port, sender_comp_id=sender_comp_id, target_comp_id=target_comp_id,
                                     username=username, password=password, heartbeat_s=heartbeat_s, use_tls=use_tls,
-                                    seq_store=seq_store if seq_store is not None else {}, log=log)
+                                    seq_store=seq_store if seq_store is not None else {}, log=log,
+                                    api_key_logon=api_key_logon)
         self._reconnect_wait_s, self._max_reconnect_wait_s = reconnect_wait_s, max_reconnect_wait_s
         self._place_timeout_s = place_timeout_s
         self._log = log

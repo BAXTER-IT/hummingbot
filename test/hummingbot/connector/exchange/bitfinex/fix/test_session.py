@@ -1,12 +1,14 @@
 """The FIX session against the Bitfinex simulator: logon, heartbeats, sequence recovery, orders, session end."""
 
 import asyncio
+import hashlib
+import hmac
 
 import pytest
 import pytest_asyncio
 
 from hummingbot.connector.exchange.bitfinex.fix.message import FixMessage
-from hummingbot.connector.exchange.bitfinex.fix.session import FixLogonError, FixSession, SessionState
+from hummingbot.connector.exchange.bitfinex.fix.session import ApiKeyLogon, FixLogonError, FixSession, SessionState
 from test.hummingbot.connector.exchange.bitfinex.fix.bitfinex_simulator import BitfinexFixSimulator
 
 pytestmark = pytest.mark.asyncio
@@ -214,3 +216,103 @@ async def test_silence_after_a_test_request_disconnects(sim):
     finally:
         sim._on_message = original
         await session.close()
+
+
+# -- logon with the account's API key (spec v1.22, Option 2) --------------------------------
+
+API_KEY, API_SECRET = "bfx-key-0123", "bfx-secret-abcdef"
+
+
+@pytest_asyncio.fixture
+async def key_sim():
+    simulator = BitfinexFixSimulator(username="fxch", password="s3cret", api_key=API_KEY, api_secret=API_SECRET)
+    await simulator.start()
+    yield simulator
+    await simulator.stop()
+
+
+def key_session(sim, sink, logon):
+    return make_session(sim, sink, username="", password="", api_key_logon=logon)
+
+
+async def test_api_key_logon_signs_a_nonce_and_the_secret_never_goes_over_the_wire(key_sim):
+    sink = Sink()
+    session = key_session(key_sim, sink, ApiKeyLogon(API_KEY, API_SECRET, clock=lambda: 1793030849.7))
+    await session.connect()
+    try:
+        assert session.state is SessionState.LOGGED_ON
+        logon = key_sim.received[0]
+        assert logon.get("553") == API_KEY
+        assert logon.get("96") == "1793030849"  # whole seconds, as in the spec's example
+        assert logon.get("554") == hmac.new(API_SECRET.encode(), b"1793030849", hashlib.sha384).hexdigest()
+        assert API_SECRET.encode() not in b"".join(key_sim.raw_received)
+    finally:
+        await session.close()
+
+
+async def test_api_key_logon_fields_follow_the_spec_order(key_sim):
+    sink = Sink()
+    session = key_session(key_sim, sink, ApiKeyLogon(API_KEY, API_SECRET))
+    await session.connect()
+    try:
+        tags = [tag for tag, _ in key_sim.received[0].body if tag in ("98", "108", "553", "554", "96")]
+        assert tags == ["98", "108", "553", "554", "96"]
+    finally:
+        await session.close()
+
+
+async def test_api_key_logon_fields_keep_the_spec_order_with_every_optional_tag(key_sim):
+    sink = Sink()
+    session = make_session(key_sim, sink, username="", password="", api_key_logon=ApiKeyLogon(API_KEY, API_SECRET),
+                           reset_seq_num_on_logon=True, protect_self_match=True)
+    await session.connect()
+    try:
+        assert [tag for tag, _ in key_sim.received[0].body] == ["98", "108", "141", "553", "554", "96", "6065"]
+    finally:
+        await session.close()
+
+
+async def test_every_logon_with_the_same_key_counts_the_nonce_up_even_within_one_second(key_sim):
+    logon = ApiKeyLogon(API_KEY, API_SECRET, clock=lambda: 1793030849.0)  # a reconnect inside the same second
+    for _ in range(2):
+        session = key_session(key_sim, Sink(), logon)
+        await session.connect()
+        try:
+            assert session.state is SessionState.LOGGED_ON
+        finally:
+            await session.close()
+    assert [m.get("96") for m in key_sim.received if m.msg_type == "A"] == ["1793030849", "1793030850"]
+
+
+async def test_a_wrong_api_secret_is_a_logon_error_with_the_venues_text(key_sim):
+    sink = Sink()
+    session = key_session(key_sim, sink, ApiKeyLogon(API_KEY, "not-the-secret"))
+    with pytest.raises(FixLogonError) as err:
+        await session.connect()
+    assert "Invalid credentials" in str(err.value)
+    assert session.state is SessionState.DISCONNECTED
+
+
+async def test_an_api_key_logon_needs_both_the_key_and_the_secret():
+    with pytest.raises(ValueError):
+        ApiKeyLogon("", API_SECRET)
+    with pytest.raises(ValueError):
+        ApiKeyLogon(API_KEY, "")
+
+
+async def test_the_api_key_logon_never_shows_the_key_or_the_secret():
+    shown = repr(ApiKeyLogon(API_KEY, API_SECRET)) + str(ApiKeyLogon(API_KEY, API_SECRET))
+    assert API_KEY not in shown and API_SECRET not in shown
+
+
+async def test_a_session_takes_one_way_of_logging_on_not_both(sim):
+    with pytest.raises(ValueError):
+        make_session(sim, Sink(), api_key_logon=ApiKeyLogon(API_KEY, API_SECRET))  # username/password also set
+
+
+async def test_a_session_without_any_credentials_fails_its_logon_without_connecting(sim):
+    session = make_session(sim, Sink(), username="", password="")
+    with pytest.raises(FixLogonError) as err:
+        await session.connect()
+    assert "no logon credentials" in str(err.value)
+    assert sim.connections == 0

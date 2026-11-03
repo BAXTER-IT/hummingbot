@@ -26,6 +26,9 @@ TAG_SENDING_TIME = "52"
 TAG_TARGET_COMP_ID = "56"
 TAG_ORIG_SENDING_TIME = "122"
 
+# Username (a FIX user or the account's API key) and Password (a password or a signature): never printed
+CREDENTIAL_TAGS = {"553", "554"}
+
 HEADER_TAGS = {TAG_BEGIN_STRING, TAG_BODY_LENGTH, TAG_MSG_TYPE, TAG_SENDER_COMP_ID, TAG_TARGET_COMP_ID,
                TAG_MSG_SEQ_NUM, TAG_SENDING_TIME, TAG_POSS_DUP, TAG_ORIG_SENDING_TIME}
 
@@ -55,8 +58,9 @@ class FixMessage:
     def get_all(self, tag: str) -> List[str]:
         return [v for t, v in self.body if t == tag]
 
-    def __repr__(self) -> str:  # compact, key-free: safe to log
-        return f"FixMessage({self.msg_type} #{self.seq_num} {' '.join(f'{t}={v}' for t, v in self.body)})"
+    def __repr__(self) -> str:  # compact, credential-free: safe to log
+        shown = " ".join(f"{t}={'***' if t in CREDENTIAL_TAGS else v}" for t, v in self.body)
+        return f"FixMessage({self.msg_type} #{self.seq_num} {shown})"
 
 
 def _checksum(data: bytes) -> str:
