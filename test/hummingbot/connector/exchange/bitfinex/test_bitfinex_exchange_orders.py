@@ -126,3 +126,30 @@ async def test_session_end_cancels_every_resting_order_in_the_tracker(exchange, 
             break
     assert order.current_state is OrderState.CANCELED
     assert exchange._is_user_stream_initialized() is False
+
+
+async def test_without_a_fix_username_the_connector_logs_on_with_its_api_key_and_trades():
+    simulator = BitfinexFixSimulator(username="fxch", password="s3cret", api_key="bfx-key", api_secret="bfx-secret")
+    host, port = await simulator.start()
+    ex = BitfinexExchange(bitfinex_api_key="bfx-key", bitfinex_secret_key="bfx-secret",
+                          bitfinex_fix_sender_comp_id="FXCHTEST", bitfinex_fix_host=host, bitfinex_fix_port=port,
+                          bitfinex_fix_tls=False, trading_pairs=["BTC-USDT"], trading_required=True)
+    ex._set_trading_pair_symbol_map(__import__("bidict").bidict({"tBTCUST": "BTC-USDT"}))
+    try:
+        await ex._fix_gateway.start()
+        await ex._fix_gateway.wait_logged_on(timeout=5)
+        order_id, _ = await ex._place_order(order_id="HB-K", trading_pair="BTC-USDT", amount=Decimal("0.001"),
+                                            trade_type=TradeType.BUY, order_type=OrderType.LIMIT_MAKER,
+                                            price=Decimal("60000"))
+        assert order_id.isdigit()
+        assert next(m for m in simulator.received if m.msg_type == "A").get("553") == "bfx-key"
+        assert b"bfx-secret" not in b"".join(simulator.raw_received)
+    finally:
+        await ex._fix_gateway.stop()
+        await simulator.stop()
+
+
+async def test_half_a_fix_login_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError):
+        BitfinexExchange(bitfinex_api_key="bfx-key", bitfinex_secret_key="bfx-secret", bitfinex_fix_username="fxch",
+                         bitfinex_fix_sender_comp_id="FXCHTEST", trading_pairs=["BTC-USDT"], trading_required=True)

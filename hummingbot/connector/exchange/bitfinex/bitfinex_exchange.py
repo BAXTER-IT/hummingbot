@@ -27,6 +27,7 @@ from hummingbot.connector.exchange.bitfinex.bitfinex_trade_limits import (
     TradeLimit,
     TradeLimitBudgetChecker,
 )
+from hummingbot.connector.exchange.bitfinex.fix.session import ApiKeyLogon
 from hummingbot.core.data_type.common import PriceType
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -42,6 +43,20 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+def _fix_login(fix_username: str, fix_password: str, api_key: str, api_secret: str) -> dict:
+    """The FIX session's own username and password when set; otherwise the account's API key (spec v1.22).
+
+    Neither (public market data only) leaves the session without credentials: it can never log on."""
+    if bool(fix_username) != bool(fix_password):
+        raise ValueError("the FIX session login needs both its username and its password; "
+                         "leave both empty to log on with the API key")
+    if fix_username:
+        return dict(username=fix_username, password=fix_password)
+    if api_key and api_secret:
+        return dict(api_key_logon=ApiKeyLogon(api_key, api_secret))
+    return {}
+
+
 class BitfinexExchange(ExchangePyBase):
     web_utils = web_utils
 
@@ -49,9 +64,10 @@ class BitfinexExchange(ExchangePyBase):
         self,
         bitfinex_api_key: str,
         bitfinex_secret_key: str,
-        bitfinex_fix_username: str,
-        bitfinex_fix_password: str,
+        *,  # by name only: the FIX fields are all strings, a positional mix-up would log on with the wrong ones
         bitfinex_fix_sender_comp_id: str,
+        bitfinex_fix_username: str = "",
+        bitfinex_fix_password: str = "",
         bitfinex_fix_host: str = "",
         bitfinex_fix_port: int = 0,
         bitfinex_fix_tls: bool = True,
@@ -76,8 +92,8 @@ class BitfinexExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._fix_gateway = BitfinexFixGateway(
             host=bitfinex_fix_host, port=int(bitfinex_fix_port or 0), sender_comp_id=bitfinex_fix_sender_comp_id,
-            username=bitfinex_fix_username, password=bitfinex_fix_password, use_tls=bitfinex_fix_tls,
-            log=lambda line: self.logger().info(line),
+            use_tls=bitfinex_fix_tls, log=lambda line: self.logger().info(line),
+            **_fix_login(bitfinex_fix_username, bitfinex_fix_password, bitfinex_api_key, bitfinex_secret_key),
         )
         self._trade_limits: Dict[str, TradeLimit] = {}
         self._abos_client = AbosTradeLimitsClient(bitfinex_abos_url, bitfinex_abos_username, bitfinex_abos_password,

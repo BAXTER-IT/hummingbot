@@ -1,6 +1,7 @@
-"""An asyncio FIX 4.4 session for the Bitfinex order gateway (spec v1.21).
+"""An asyncio FIX 4.4 session for the Bitfinex order gateway (spec v1.22).
 
-Owns the TCP/TLS connection, the logon handshake (Username/Password), heartbeats and test
+Owns the TCP/TLS connection, the logon handshake (the FIX session's Username/Password, or the
+account's API key with a signed nonce: ``ApiKeyLogon``), heartbeats and test
 requests, sequence numbers in both directions with gap recovery (we send ResendRequest on a
 gap; we answer theirs with a SequenceReset-GapFill, since execution reports only ever flow
 towards us), and the logout/disconnect bookkeeping. Application messages (D, F, G in; 8, 9, h
@@ -12,6 +13,8 @@ continues numbering instead of resetting (which would make the gateway replay no
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ssl
 import time
 from datetime import datetime, timezone
@@ -41,6 +44,35 @@ class FixLogonError(RuntimeError):
     """The gateway refused or dropped the logon; the message carries its text, never a credential."""
 
 
+class ApiKeyLogon:
+    """Log on with the account's Bitfinex API key instead of a FIX username and password (spec v1.22, Option 2).
+
+    The secret never goes over the wire: Username is the API key, Password is HMAC-SHA384 of the nonce keyed
+    with the API secret, written as lower-case hex (the spec names no encoding; hex is how Bitfinex reads every
+    other HMAC-SHA384 signature, REST and websocket alike), and RawData is the nonce itself. The nonce is whole
+    seconds since 1970, as in the spec's example (its RawData is a FIX INT, which a QuickFIX-style gateway reads
+    as 32 bits: microseconds would not fit), and one more than the last when two logons fall in the same
+    second, because it must keep increasing. Keep one instance per key for the life of the process.
+    The key needs Bitfinex's write permission "Create and cancel orders" for an order-entry session.
+    """
+
+    def __init__(self, api_key: str, api_secret: str, clock: Callable[[], float] = time.time) -> None:
+        if not api_key or not api_secret:
+            raise ValueError("an API-key logon needs both the API key and its secret")
+        self._api_key, self._api_secret = api_key, api_secret
+        self._clock = clock
+        self._last_nonce = 0
+
+    def logon_fields(self) -> list:
+        nonce = max(int(self._clock()), self._last_nonce + 1)
+        self._last_nonce = nonce
+        signature = hmac.new(self._api_secret.encode(), str(nonce).encode(), hashlib.sha384).hexdigest()
+        return [("553", self._api_key), ("554", signature), ("96", str(nonce))]
+
+    def __repr__(self) -> str:
+        return "ApiKeyLogon(key and secret hidden)"
+
+
 def fix_time(ts: Optional[float] = None) -> str:
     return datetime.fromtimestamp(ts if ts is not None else time.time(), timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3]
 
@@ -52,8 +84,8 @@ class FixSession:
         port: int,
         sender_comp_id: str,
         target_comp_id: str,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
         heartbeat_s: float = 10.0,
         use_tls: bool = True,
         ssl_context: Optional[ssl.SSLContext] = None,
@@ -65,10 +97,14 @@ class FixSession:
         logon_timeout_s: float = 10.0,
         clock: Callable[[], float] = time.time,
         log: Log = print,
+        api_key_logon: Optional[ApiKeyLogon] = None,
     ) -> None:
+        if api_key_logon is not None and (username or password):
+            raise ValueError("log on with either the FIX username and password or the API key, not both")
         self._host, self._port = host, port
         self._sender, self._target = sender_comp_id, target_comp_id
         self._username, self._password = username, password
+        self._api_key_logon = api_key_logon
         self._heartbeat_s = heartbeat_s
         self._use_tls, self._ssl_context = use_tls, ssl_context
         self._store = seq_store if seq_store is not None else {}
@@ -116,6 +152,8 @@ class FixSession:
 
     async def connect(self) -> None:
         """Open the connection and complete the logon handshake, or raise FixLogonError."""
+        if self._api_key_logon is None and not (self._username and self._password):
+            raise FixLogonError("no logon credentials: set the FIX username and password, or the API key and secret")
         self._load_counters()
         self._set_state(SessionState.CONNECTING)
         ctx = None
@@ -133,7 +171,10 @@ class FixSession:
         body = [("98", "0"), ("108", str(int(self._heartbeat_s)))]
         if self._reset_on_logon:
             body.append(("141", "Y"))
-        body += [("553", self._username), ("554", self._password)]
+        if self._api_key_logon is not None:
+            body += self._api_key_logon.logon_fields()
+        else:
+            body += [("553", self._username), ("554", self._password)]
         if self._protect_self_match:
             body.append(("6065", "Y"))
         self._set_state(SessionState.LOGON_SENT)

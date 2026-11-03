@@ -63,3 +63,10 @@ def test_values_containing_soh_are_refused_at_encode_time():
     with pytest.raises(FixProtocolError):
         encode(FixMessage("0", [("58", "a" + SOH + "b")]), sender="A", target="B", seq_num=1,
                sending_time="20260911-10:00:00.000")
+
+
+def test_a_printed_logon_hides_its_credentials():
+    logon = FixMessage("A", [("98", "0"), ("108", "10"), ("553", "bfx-key-0123"), ("554", "s3cret"), ("96", "1793030849")])
+    shown = repr(logon)
+    assert "bfx-key-0123" not in shown and "s3cret" not in shown
+    assert "108=10" in shown and "96=1793030849" in shown

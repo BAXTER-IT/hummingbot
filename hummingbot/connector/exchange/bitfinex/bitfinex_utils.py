@@ -83,7 +83,8 @@ class BitfinexConfigMap(BaseConnectorConfigMap):
     connector: str = "bitfinex"
     bitfinex_api_key: SecretStr = Field(
         default=...,
-        json_schema_extra={"prompt": "Enter your Bitfinex REST API key (read-only: balances/fees/history)",
+        json_schema_extra={"prompt": "Enter your Bitfinex API key (REST reads; also the FIX logon when no FIX "
+                                     "username is set, which needs its 'Create and cancel orders' permission)",
                            "is_secure": True, "is_connect_key": True, "prompt_on_new": True},
     )
     bitfinex_secret_key: SecretStr = Field(
@@ -91,14 +92,17 @@ class BitfinexConfigMap(BaseConnectorConfigMap):
         json_schema_extra={"prompt": "Enter your Bitfinex REST API secret", "is_secure": True,
                            "is_connect_key": True, "prompt_on_new": True},
     )
+    # empty username and password: the FIX session logs on with the API key above (spec v1.22)
     bitfinex_fix_username: SecretStr = Field(
-        default=...,
-        json_schema_extra={"prompt": "Enter your Bitfinex FIX session username", "is_secure": True,
+        default=SecretStr(""),
+        json_schema_extra={"prompt": "Enter your Bitfinex FIX session username (empty: log on with the API key)",
+                           "is_secure": True,
                            "is_connect_key": True, "prompt_on_new": True},
     )
     bitfinex_fix_password: SecretStr = Field(
-        default=...,
-        json_schema_extra={"prompt": "Enter your Bitfinex FIX session password", "is_secure": True,
+        default=SecretStr(""),
+        json_schema_extra={"prompt": "Enter your Bitfinex FIX session password (empty: log on with the API key)",
+                           "is_secure": True,
                            "is_connect_key": True, "prompt_on_new": True},
     )
     bitfinex_fix_sender_comp_id: SecretStr = Field(

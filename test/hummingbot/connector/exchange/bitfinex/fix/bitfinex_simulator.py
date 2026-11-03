@@ -1,6 +1,8 @@
-"""A stand-in for the Bitfinex FIX 4.4 gateway, faithful to the v1.21 spec in the ways that bite.
+"""A stand-in for the Bitfinex FIX 4.4 gateway, faithful to the v1.22 spec in the ways that bite.
 
-Logon with Username/Password (a wrong one gets a Logout and a dropped connection); heartbeats and
+Logon with Username/Password, or with the account's API key (v1.22 Option 2: Username = the key,
+Password = HMAC-SHA384 of the RawData nonce keyed with the API secret, as hex; the nonce must keep
+increasing) — a wrong one gets a Logout and a dropped connection; heartbeats and
 TestRequest; sequence numbers with ResendRequest / SequenceReset-GapFill / PossDup replay;
 NewOrderSingle → ExecutionReport(New) and, when the test asks, a fill; OrderCancelRequest by
 OrigClOrdID → ExecutionReport(Canceled) or OrderCancelReject(unknown order); TradingSessionStatus
@@ -8,6 +10,8 @@ Pre-Close + Logout for the daily session end. Tests drive it through the public 
 """
 
 import asyncio
+import hashlib
+import hmac
 import itertools
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -20,8 +24,12 @@ def now_fix() -> str:
 
 
 class BitfinexFixSimulator:
-    def __init__(self, username="user", password="pw", comp_id="BfxComp", heartbeat_s: Optional[float] = None):
+    def __init__(self, username="user", password="pw", comp_id="BfxComp", heartbeat_s: Optional[float] = None,
+                 api_key: Optional[str] = None, api_secret: Optional[str] = None):
         self.username, self.password, self.comp_id = username, password, comp_id
+        self.api_key, self.api_secret = api_key, api_secret
+        self.last_nonce = 0                            # the highest API-key logon nonce accepted so far
+        self.raw_received: List[bytes] = []            # every byte the client sent, as it arrived
         self.heartbeat_s = heartbeat_s  # None = accept the client's
         self.received: List[FixMessage] = []          # every message from the client, in order
         self.sent: List[bytes] = []                    # every frame we sent (raw), for PossDup replay
@@ -110,6 +118,7 @@ class BitfinexFixSimulator:
                 data = await reader.read(4096)
                 if not data:
                     break
+                self.raw_received.append(data)
                 for msg in parser.feed(data):
                     await self._on_message(msg)
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
@@ -155,7 +164,7 @@ class BitfinexFixSimulator:
 
     async def _on_logon(self, msg: FixMessage):
         self._client_comp = msg.sender
-        if msg.get("553") != self.username or msg.get("554") != self.password:
+        if not self._credentials_ok(msg):
             await self._send(FixMessage("5", [("58", "Invalid credentials")]))
             return await self.drop_connection()
         if msg.get("141") == "Y":
@@ -168,6 +177,18 @@ class BitfinexFixSimulator:
         hb = str(self.heartbeat_s or msg.get("108"))
         self._logged_on.set()
         await self._send(FixMessage("A", [("98", "0"), ("108", hb)] + ([("141", "Y")] if msg.get("141") == "Y" else [])))
+
+    def _credentials_ok(self, msg: FixMessage) -> bool:
+        if self.api_key is not None and msg.get("553") == self.api_key:
+            nonce = msg.get("96") or ""
+            if not nonce.isdigit() or int(nonce) <= self.last_nonce:
+                return False
+            expected = hmac.new(self.api_secret.encode(), nonce.encode(), hashlib.sha384).hexdigest()
+            if not hmac.compare_digest(msg.get("554") or "", expected):
+                return False
+            self.last_nonce = int(nonce)
+            return True
+        return msg.get("553") == self.username and msg.get("554") == self.password
 
     async def _on_new_order(self, msg: FixMessage):
         cl = msg.get("11")
